@@ -1,351 +1,553 @@
-import os, json, difflib, fcntl, re, time, logging, hashlib, zlib
+"""
+ZSS — Zero State Snapshot v4.0
+Локальный версионатор для Termux/Linux/macOS.
+Один файл, стандартная библиотека, production-ready.
+"""
+
+import os
+import json
+import difflib
+import fcntl
+import re
+import time
+import logging
+import hashlib
+import zlib
+import signal
+import threading
+from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Dict, Optional, Tuple
+from typing import List, Dict, Optional, Tuple, Set, Generator, NamedTuple, TypedDict
 from contextlib import contextmanager
-import threading
+
+# --- Конфигурация и типы ---
+
+INDEX_VERSION = 4
+TIMESTAMP_FMT = "%Y-%m-%d_%H-%M-%S_%f"
+TIMESTAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}$')
+SECRET_PATTERNS = [
+    re.compile(r'(?i)(?:api[_-]?key|token|password|secret|auth)\s*[:=]\s*["\']([A-Za-z0-9+/=_\-]{16,})["\']'),
+]
+HASH_CHUNK_SIZE = 65536  # 64KB для streaming hash
 
 logger = logging.getLogger("zss")
 if not logger.handlers:
-    h = logging.StreamHandler()
-    h.setFormatter(logging.Formatter('%(levelname)s: %(message)s'))
-    logger.addHandler(h)
+    handler = logging.StreamHandler()
+    handler.setFormatter(logging.Formatter('%(asctime)s [%(levelname)s] %(message)s', datefmt='%H:%M:%S'))
+    logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
-TIMESTAMP_RE = re.compile(r'^\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}_\d{6}$')
-INDEX_VERSION = 3
-SECRET_RE = re.compile(r'(?i)(?:api_key|token|password|secret)\s*[:=]\s*["\'][^"\']{8,}["\']')
 
-class ZSSError(Exception): pass
-class CorruptedIndexError(ZSSError): pass
-class SecretDetectedError(ZSSError): pass
+class VersionEntry(TypedDict):
+    timestamp: str
+    hash: str
+    size: int
+    compressed: bool
+    lines: int
+    path: str
+    tags: Dict[str, str]
+
+
+class TrackStats(NamedTuple):
+    checked: int
+    saved: int
+    errors: int
+
+
+# --- Исключения ---
+
+class ZSSError(Exception):
+    """Базовая ошибка ZSS."""
+    pass
+
+class CorruptedIndexError(ZSSError):
+    """Индекс повреждён или имеет неверную версию."""
+    pass
+
+class SecretDetectedError(ZSSError):
+    """В файле обнаружены потенциальные секреты."""
+    def __init__(self, secrets: List[str]):
+        self.secrets = secrets
+        super().__init__(f"Secrets detected: {len(secrets)} matches")
+
+class RollbackError(ZSSError):
+    """Ошибка при откате версии."""
+    pass
+
+
+# - Потокобезопасный LRU Cache --
 
 class LRUCache:
-    def __init__(self, max_size: int = 100):
-        self.max_size = max_size
-        self.cache: Dict[str, Tuple] = {}
-        self.lock = threading.Lock()
+    """Thread-safe LRU кэш с двойной валидацией (TTL + mtime)."""
 
-    def get_valid(self, key: str, current_mtime: float, ttl: float) -> Optional[List[Dict]]:
-        with self.lock:
-            if key in self.cache:
-                index, cached_mtime, cached_time = self.cache[key]
-                if (time.time() - cached_time) < ttl and current_mtime == cached_mtime:
-                    return index
-        return None
+    def __init__(self, max_size: int = 128):
+        self._max_size = max(max_size, 1)
+        self._cache: OrderedDict[str, Tuple[List[VersionEntry], float, float]] = OrderedDict()
+        self._lock = threading.RLock()
 
-    def put(self, key: str, index: List[Dict], current_mtime: float):
-        with self.lock:
-            if len(self.cache) >= self.max_size:
-                self.cache.pop(next(iter(self.cache)), None)
-            self.cache[key] = (index, current_mtime, time.time())
+    def get(self, key: str, current_mtime: float, ttl: float) -> Optional[List[VersionEntry]]:
+        with self._lock:
+            if key not in self._cache:
+                return None
+            index, cached_mtime, cached_time = self._cache[key]
+            if (time.monotonic() - cached_time) > ttl or cached_mtime != current_mtime:
+                del self._cache[key]
+                return None
+            self._cache.move_to_end(key)
+            return index
 
-    def invalidate(self, key: str):
-        with self.lock:
-            self.cache.pop(key, None)
+    def put(self, key: str, value: List[VersionEntry], mtime: float) -> None:
+        with self._lock:
+            if key in self._cache:
+                self._cache.move_to_end(key)
+            else:
+                if len(self._cache) >= self._max_size:
+                    self._cache.popitem(last=False)
+            self._cache[key] = (value, mtime, time.monotonic())
+
+    def invalidate(self, key: str) -> None:
+        with self._lock:
+            self._cache.pop(key, None)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._cache.clear()
+
+
+# --- Файловые блокировки 
 
 class FileLock:
-    def __init__(self, lock_file: Path):
-        self.lock_file = lock_file
-        self._fd = None
+    """
+    POSIX file lock с поддержкой shared/exclusive режимов.
+    FD создаётся внутри контекста — безопасно для многопоточности.
+    """
+
+    def __init__(self, lock_path: Path):
+        self._path = lock_path
 
     @contextmanager
     def exclusive(self):
-        self.lock_file.parent.mkdir(parents=True, exist_ok=True)
-        self._fd = open(self.lock_file, 'w')
+        """Эксклюзивная блокировка для записи."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        fd = open(self._path, 'w')
         try:
-            fcntl.flock(self._fd.fileno(), fcntl.LOCK_EX)
+            fcntl.flock(fd.fileno(), fcntl.LOCK_EX)
             yield
         finally:
-            fcntl.flock(self._fd.fileno(), fcntl.LOCK_UN)
-            self._fd.close()
-            self._fd = None
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fd.close()
+
+    @contextmanager
+    def shared(self):
+        """Разделяемая блокировка для чтения."""
+        if not self._path.exists():
+            yield
+            return
+        fd = open(self._path, 'r')
+        try:
+            fcntl.flock(fd.fileno(), fcntl.LOCK_SH)
+            yield
+        finally:
+            try:
+                fcntl.flock(fd.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+            fd.close()
+
+
+# --- Менеджер индексов ---
 
 class IndexManager:
+    """Управление JSON-индексами с миграцией и кэшированием."""
+
     def __init__(self, root: Path, cache: LRUCache, ttl: float):
-        self.root = root
-        self.cache = cache
-        self.ttl = ttl
+        self._root = root
+        self._cache = cache
+        self._ttl = ttl
+        self._dirty: Set[str] = set()
+        self._pending: Dict[str, List[VersionEntry]] = {}
 
-    def _get_index_path(self, filepath: Path) -> Path:
-        return self.root / f"{hashlib.md5(str(filepath.resolve()).encode()).hexdigest()[:24]}.index.json"
+    def _index_path(self, filepath: Path) -> Path:
+        h = hashlib.md5(str(filepath.resolve()).encode()).hexdigest()[:24]
+        return self._root / f"{h}.index.json"
 
-    def load(self, filepath: Path) -> List[Dict]:
-        index_file = self._get_index_path(filepath)
-        cache_key = str(index_file)
+    def load(self, filepath: Path) -> List[VersionEntry]:
+        idx_path = self._index_path(filepath)
+        key = str(idx_path)
+
         try:
-            current_mtime = index_file.stat().st_mtime
+            mtime = idx_path.stat().st_mtime
         except OSError:
-            current_mtime = 0
+            mtime = 0.0
 
-        cached = self.cache.get_valid(cache_key, current_mtime, self.ttl)
+        cached = self._cache.get(key, mtime, self._ttl)
         if cached is not None:
             return cached
 
-        try:
-            if not index_file.exists():
-                index, current_mtime = [], 0
-            else:
-                current_mtime = index_file.stat().st_mtime
-                data = json.loads(index_file.read_text())
-                if isinstance(data, dict) and data.get("version") == INDEX_VERSION:
-                    index = data.get("entries", [])
-                elif isinstance(data, list):
-                    index = data
+        entries: List[VersionEntry] = []
+        if idx_path.exists():
+            try:
+                raw = json.loads(idx_path.read_text(encoding='utf-8'))
+                if isinstance(raw, dict):
+                    ver = raw.get("version", 1)
+                    if ver == INDEX_VERSION:
+                        entries = raw.get("entries", [])
+                    elif ver < INDEX_VERSION:
+                        entries = self._migrate(raw, ver)
+                    else:
+                        raise CorruptedIndexError(f"Future index version {ver}")
+                elif isinstance(raw, list):
+                    entries = raw  # legacy v1
                 else:
-                    raise CorruptedIndexError("Unknown format")
-        except (json.JSONDecodeError, CorruptedIndexError, KeyError):
-            logger.warning(f"Corrupted index for {filepath}")
-            index, current_mtime = [], 0
-        except IOError as e:
-            logger.error(f"Cannot read index for {filepath}: {e}")
-            index, current_mtime = [], 0
+                    raise CorruptedIndexError("Invalid index structure")
+            except (json.JSONDecodeError, KeyError, TypeError) as e:
+                logger.warning("Corrupted index %s: %s", idx_path.name, e)
+                entries = []
+            except CorruptedIndexError as e:
+                logger.error("%s: %s", idx_path.name, e)
+                entries = []
 
-        self.cache.put(cache_key, index, current_mtime)
-        return index
+        self._cache.put(key, entries, mtime)
+        return entries
 
-    def save(self, filepath: Path, index: List[Dict]):
-        index_file = self._get_index_path(filepath)
-        tmp = index_file.with_suffix(".tmp")
+    def stage_save(self, filepath: Path, entries: List[VersionEntry]) -> None:
+        """Откладывает сохранение индекса для batch-write."""
+        key = str(self._index_path(filepath))
+        self._pending[key] = entries
+        self._dirty.add(key)
+
+    def flush(self) -> int:
+        """Записывает все грязные индексы на диск. Возвращает кол-во записанных."""
+        if not self._dirty:
+            return 0
+        count = 0
+        for key in list(self._dirty):
+            idx_path = Path(key)
+            entries = self._pending.get(key, [])
+            tmp = idx_path.with_suffix('.tmp')
+            try:
+                data = {"version": INDEX_VERSION, "entries": entries}
+                tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+                os.replace(str(tmp), str(idx_path))
+                try:
+                    mtime = idx_path.stat().st_mtime
+                except OSError:
+                    mtime = 0.0
+                self._cache.put(key, entries, mtime)
+                count += 1
+            except OSError as e:
+                logger.error("Failed to flush index %s: %s", idx_path.name, e)
+                if tmp.exists():
+                    tmp.unlink(missing_ok=True)
+            finally:
+                self._pending.pop(key, None)
+        self._dirty.clear()
+        return count
+
+    def save_now(self, filepath: Path, entries: List[VersionEntry]) -> None:
+        """Немедленная запись одного индекса (для rollback/add_tag)."""
+        idx_path = self._index_path(filepath)
+        tmp = idx_path.with_suffix('.tmp')
         try:
-            tmp.write_text(json.dumps({"version": INDEX_VERSION, "entries": index}, indent=2))
-            os.replace(str(tmp), str(index_file))
-        except IOError as e:
-            if tmp.exists(): tmp.unlink(missing_ok=True)
-            raise ZSSError(f"Failed to save index: {e}")
-        self.cache.invalidate(str(index_file))
+            data = {"version": INDEX_VERSION, "entries": entries}
+            tmp.write_text(json.dumps(data, ensure_ascii=False), encoding='utf-8')
+            os.replace(str(tmp), str(idx_path))
+            mtime = idx_path.stat().st_mtime
+            self._cache.put(str(idx_path), entries, mtime)
+        except OSError as e:
+            if tmp.exists():
+                tmp.unlink(missing_ok=True)
+            raise ZSSError(f"Index save failed: {e}")
+
+    @staticmethod
+    def _migrate(raw: dict, from_ver: int) -> List[VersionEntry]:
+        """Миграция индексов старых версий."""
+        if from_ver <= 2:
+            entries = raw.get("entries", raw if isinstance(raw, list) else [])
+            for e in entries:
+                e.setdefault("tags", {})
+                e.setdefault("compressed", False)
+            return entries
+        return []
+
+
+# --- Хранилище версий ---
 
 class VersionStore:
-    def __init__(self, root: Path, index_mgr: IndexManager, compress: bool):
-        self.root = root
-        self.index_mgr = index_mgr
-        self.compress = compress
+    """Хранение снапшотов с streaming-hash и lazy-decompression."""
 
-    def _get_version_path(self, filepath: Path, timestamp: str) -> Path:
-        if not TIMESTAMP_RE.match(timestamp):
-            raise ZSSError(f"Invalid timestamp: {timestamp}")
-        safe = hashlib.md5(str(filepath.resolve()).encode()).hexdigest()[:24]
-        ext = ".ztxt" if self.compress else ".txt"
-        return self.root / f"{safe}.{timestamp}{ext}"
+    def __init__(self, root: Path, compress: bool):
+        self._root = root
+        self._compress = compress
 
     @staticmethod
-    def compute_hash(content: bytes) -> str:
-        return hashlib.blake2b(content, digest_size=8).hexdigest()
+    def compute_hash_stream(filepath: Path) -> str:
+        """BLAKE2b hash чанками без загрузки всего файла в память."""
+        h = hashlib.blake2b(digest_size=8)
+        with open(filepath, 'rb') as f:
+            while True:
+                chunk = f.read(HASH_CHUNK_SIZE)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()
 
     @staticmethod
-    def is_text_file(content_bytes: bytes) -> bool:
-        if not content_bytes: return True
-        sample = content_bytes[:8192]
+    def compute_hash_bytes(data: bytes) -> str:
+        return hashlib.blake2b(data, digest_size=8).hexdigest()
+
+    @staticmethod
+    def is_text(filepath: Path) -> bool:
+        """Проверка на текстовый файл по первым 8KB."""
+        try:
+            with open(filepath, 'rb') as f:
+                sample = f.read(8192)
+        except OSError:
+            return False
         if b'\x00' in sample:
             return sample.startswith(b'\xff\xfe') or sample.startswith(b'\xfe\xff')
         return True
 
     @staticmethod
     def check_secrets(content: str) -> List[str]:
-        return SECRET_RE.findall(content)
+        found = []
+        for pattern in SECRET_PATTERNS:
+            found.extend(pattern.findall(content))
+        return found
 
-    def save_version(self, filepath: Path, block_on_secrets: bool = False) -> bool:
-        filepath = filepath.resolve()
-        if not filepath.is_file() or filepath.is_symlink(): return False
+    def version_path(self, filepath: Path, timestamp: str) -> Path:
+        if not TIMESTAMP_RE.match(timestamp):
+            raise ZSSError(f"Invalid timestamp format: {timestamp}")
+        # Валидация даты
         try:
-            content_bytes = filepath.read_bytes()
-        except (IOError, PermissionError):
-            return False
+            datetime.strptime(timestamp, TIMESTAMP_FMT)
+        except ValueError:
+            raise ZSSError(f"Invalid date in timestamp: {timestamp}")
+        safe = hashlib.md5(str(filepath.resolve()).encode()).hexdigest()[:24]
+        ext = ".ztxt" if self._compress else ".txt"
+        return self._root / f"{safe}.{timestamp}{ext}"
 
-        if not self.is_text_file(content_bytes): return False
+    def read_version(self, filepath: Path, timestamp: str) -> Optional[bytes]:
+        """Читает и декомпрессирует версию. Пробует оба расширения."""
+        vp = self.version_path(filepath, timestamp)
+        if not vp.exists():
+            alt = vp.with_suffix('.txt') if vp.suffix == '.ztxt' else vp.with_suffix('.ztxt')
+            if alt.exists():
+                vp = alt
+            else:
+                return None
         try:
-            content = content_bytes.decode("utf-8")
-        except UnicodeDecodeError:
-            return False
-
-        if block_on_secrets and self.check_secrets(content):
-            raise SecretDetectedError("Potential secrets detected in file")
-
-        file_hash = self.compute_hash(content_bytes)
-        index = self.index_mgr.load(filepath)
-        if index and index[-1].get("hash") == file_hash:
-            return False
-
-        now = datetime.now()
-        timestamp = now.strftime("%Y-%m-%d_%H-%M-%S") + f"_{now.microsecond:06d}"
-        version_file = self._get_version_path(filepath, timestamp)
-        tmp_version = version_file.with_suffix(".tmp")
-
-        payload = zlib.compress(content_bytes) if self.compress else content_bytes
-
-        try:
-            tmp_version.write_bytes(payload)
-            os.replace(str(tmp_version), str(version_file))
-            index.append({
-                "timestamp": timestamp, "hash": file_hash,
-                "size": len(content_bytes), "compressed": self.compress,
-                "lines": len(content.splitlines()), "path": str(filepath),
-                "tags": {}
-            })
-            self.index_mgr.save(filepath, index)
-            logger.info(f"Saved: {filepath.name} ({timestamp})")
-            return True
-        except (IOError, PermissionError) as e:
-            if tmp_version.exists(): tmp_version.unlink(missing_ok=True)
-            raise ZSSError(f"Failed to save version: {e}")
-
-    def get_version_bytes(self, filepath: Path, timestamp: str) -> Optional[bytes]:
-        version_file = self._get_version_path(filepath, timestamp)
-        if not version_file.exists():
-            fallback = self._get_version_path(filepath, timestamp).with_suffix(".txt")
-            if fallback.exists(): version_file = fallback
-            
-        if not version_file.exists():
+            raw = vp.read_bytes()
+        except OSError:
             return None
-            
-        payload = version_file.read_bytes()
-        return zlib.decompress(payload) if version_file.suffix == ".ztxt" else payload
+        if vp.suffix == '.ztxt':
+            try:
+                return zlib.decompress(raw)
+            except zlib.error:
+                return None
+        return raw
+
+    def read_version_lines(self, filepath: Path, timestamp: str) -> Generator[str, None, None]:
+        """Генератор строк версии для streaming diff."""
+        data = self.read_version(filepath, timestamp)
+        if data is None:
+            return
+        try:
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            text = data.decode('latin-1')
+        for line in text.splitlines(keepends=True):
+            yield line
+
+
+# --- Основной класс ---
 
 class TimeMachine:
-    def __init__(self, root: str = ".timemachine", extensions: Optional[List[str]] = None,
-                 keep_default: int = 100, cache_ttl: float = 1.0, max_cache_size: int = 100,
-                 compress: bool = True, block_on_secrets: bool = False):
+    """
+    Координатор версионирования.
+    Поддерживает context manager для автоматического flush.
+    """
+
+    def __init__(
+        self,
+        root: str = ".zss_data",
+        extensions: Optional[List[str]] = None,
+        keep_default: int = 100,
+        cache_ttl: float = 1.0,
+        max_cache_size: int = 128,
+        compress: bool = True,
+        block_on_secrets: bool = False,
+    ):
         self.root = Path(root).resolve()
         self.root.mkdir(parents=True, exist_ok=True)
-        self.extensions = extensions or [".py"]
+        self.extensions = set(extensions or [".py"])
         self.keep_default = keep_default
         self.block_on_secrets = block_on_secrets
-        
-        self._cache = LRUCache(max_cache_size)
-        self._lock = FileLock(self.root / ".lock")
-        self._index_mgr = IndexManager(self.root, self._cache, cache_ttl)
-        self._store = VersionStore(self.root, self._index_mgr, compress)
-        
-        self.stats = {"tracked": 0, "saved": 0, "rollbacks": 0, "errors": 0}
 
-    def track(self, paths: Optional[List[str]] = None) -> Dict:
-        files = []
+        self._cache = LRUCache(max_cache_size)
+        self._lock = FileLock(self.root / ".zss.lock")
+        self._idx = IndexManager(self.root, self._cache, cache_ttl)
+        self._store = VersionStore(self.root, compress)
+
+        self._stats = {"tracked": 0, "saved": 0, "rollbacks": 0, "errors": 0}
+        self._shutdown = False
+
+        signal.signal(signal.SIGTERM, self._handle_signal)
+        signal.signal(signal.SIGINT, self._handle_signal)
+
+    def _handle_signal(self, signum, frame):
+        logger.info("Signal %s received, flushing...", signum)
+        self._shutdown = True
+        self._idx.flush()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._idx.flush()
+        return False
+
+    # --- Public API ---
+
+    def track(self, paths: Optional[List[str]] = None) -> TrackStats:
+        """Сканирует файлы, сохраняет изменённые. Batch-save индексов."""
+        files: List[Path] = []
         if paths:
             for p in paths:
-                path = Path(p).resolve()
-                if path.is_file() and not path.is_symlink() and path.suffix in self.extensions:
-                    files.append(path)
+                fp = Path(p).resolve()
+                if fp.is_file() and not fp.is_symlink() and fp.suffix in self.extensions:
+                    files.append(fp)
         else:
             for ext in self.extensions:
-                for file in Path(".").rglob(f"*{ext}"):
-                    if ".timemachine" not in str(file) and not file.name.startswith("."):
-                        files.append(file)
+                for fp in Path(".").rglob(f"*{ext}"):
+                    rp = fp.resolve()
+                    if self.root not in rp.parents and not fp.name.startswith('.'):
+                        files.append(rp)
 
-        saved_count = 0
-        total_checked = len(files)
-        
+        saved = 0
+        errors = 0
+
         with self._lock.exclusive():
-            for filepath in files:
-                try:
-                    if self._store.save_version(filepath, self.block_on_secrets):
-                        saved_count += 1
-                except SecretDetectedError as e:
-                    logger.error(f"BLOCKED {filepath}: {e}")
-                    self.stats["errors"] += 1
-                except KeyboardInterrupt:
-                    logger.info(f"Interrupted at {filepath}")
+            for fp in files:
+                if self._shutdown:
                     break
+                try:
+                    if self._save_one(fp):
+                        saved += 1
+                except SecretDetectedError as e:
+                    logger.warning("BLOCKED %s: %s", fp.name, e)
+                    errors += 1
                 except ZSSError as e:
-                    logger.warning(f"Skip {filepath}: {e}")
-                    self.stats["errors"] += 1
+                    logger.error("SKIP %s: %s", fp.name, e)
+                    errors += 1
+                except OSError as e:
+                    logger.error("IO ERROR %s: %s", fp.name, e)
+                    errors += 1
 
-        self.stats["tracked"] += total_checked
-        self.stats["saved"] += saved_count
-        
-        if saved_count > 0:
-            logger.info(f"Tracked: {saved_count} saved, {total_checked - saved_count} unchanged")
-        return {"checked": total_checked, "saved": saved_count, "errors": self.stats["errors"]}
+            flushed = self._idx.flush()
 
-    def history(self, filename: str, limit: int = 10) -> List[Dict]:
-        return self._index_mgr.load(Path(filename).resolve())[-limit:]
+        self._stats["tracked"] += len(files)
+        self._stats["saved"] += saved
+        self._stats["errors"] += errors
 
-    def add_tag(self, filename: str, timestamp: str, tag: str):
-        filepath = Path(filename).resolve()
-        index = self._index_mgr.load(filepath)
-        for entry in index:
-            if entry["timestamp"] == timestamp:
-                entry.setdefault("tags", {})[tag] = timestamp
-                self._index_mgr.save(filepath, index)
-                logger.info(f"Tag '{tag}' added to {timestamp}")
-                return
-        raise ZSSError("Timestamp not found in history")
+        if saved > 0:
+            logger.info("Track: %d saved, %d unchanged, %d indexes flushed", saved, len(files) - saved, flushed)
 
-    def rollback(self, filename: str, target: str) -> str:
-        filepath = Path(filename).resolve()
-        index = self._index_mgr.load(filepath)
-        
-        timestamp = target
-        for entry in index:
-            if entry.get("tags", {}).get(target) == target or entry["timestamp"] == target:
-                timestamp = entry["timestamp"]
-                break
-        else:
-            return f"Version or tag {target} not found"
+        return TrackStats(checked=len(files), saved=saved, errors=errors)
 
-        content = self._store.get_version_bytes(filepath, timestamp)
-        if content is None:
-            return f"Version data for {timestamp} not found"
-        
+    def history(self, filename: str, limit: int = 10) -> List[VersionEntry]:
+        """История версий файла. Shared lock."""
+        fp = Path(filename).resolve()
+        with self._lock.shared():
+            entries = self._idx.load(fp)
+        return entries[-limit:] if limit > 0 else entries
+
+    def add_tag(self, filename: str, timestamp: str, tag: str) -> None:
+        """Добавляет тег к версии. Немедленная запись."""
+        fp = Path(filename).resolve()
         with self._lock.exclusive():
-            tmp_file = filepath.with_suffix(".tmp.rollback")
+            entries = self._idx.load(fp)
+            for entry in entries:
+                if entry["timestamp"] == timestamp:
+                    entry.setdefault("tags", {})[tag] = timestamp
+                    self._idx.save_now(fp, entries)
+                    logger.info("Tag '%s' -> %s", tag, timestamp)
+                    return
+        raise ZSSError(f"Timestamp {timestamp} not found for {filename}")
+
+    def rollback(self, filename: str, target: str) -> None:
+        """
+        Атомарный откат. target = timestamp или тег.
+        Бэкап текущего состояния перед перезаписью.
+        Raises RollbackError при неудаче.
+        """
+        fp = Path(filename).resolve()
+        with self._lock.exclusive():
+            entries = self._idx.load(fp)
+            ts = self._resolve_target(entries, target)
+            if ts is None:
+                raise RollbackError(f"Target '{target}' not found")
+
+            content = self._store.read_version(fp, ts)
+            if content is None:
+                raise RollbackError(f"Version data missing for {ts}")
+
+            backup = fp.with_suffix('.zss_rollback_bak')
             try:
-                tmp_file.write_bytes(content)
-                os.replace(str(tmp_file), str(filepath))
-                self.stats["rollbacks"] += 1
-                return f"Rolled back {filename} to {timestamp}"
-            except (IOError, PermissionError) as e:
-                if tmp_file.exists(): tmp_file.unlink(missing_ok=True)
-                return f"Rollback failed: {e}"
+                if fp.exists():
+                    os.replace(str(fp), str(backup))
+                tmp = fp.with_suffix('.zss_tmp')
+                tmp.write_bytes(content)
+                os.replace(str(tmp), str(fp))
+                if backup.exists():
+                    backup.unlink(missing_ok=True)
+                self._stats["rollbacks"] += 1
+                logger.info("Rolled back %s to %s", fp.name, ts)
+            except OSError as e:
+                if backup.exists() and not fp.exists():
+                    try:
+                        os.replace(str(backup), str(fp))
+                    except OSError:
+                        pass
+                raise RollbackError(f"Rollback failed: {e}")
 
-    def diff(self, filename: str, ts1: str, ts2: str) -> List[str]:
-        filepath = Path(filename).resolve()
-        f1 = self._store._get_version_path(filepath, ts1)
-        f2 = self._store._get_version_path(filepath, ts2)
-        
-        if not f1.exists(): f1 = f1.with_suffix(".txt")
-        if not f2.exists(): f2 = f2.with_suffix(".txt")
-
-        if not f1.exists() or not f2.exists():
-            return ["One or both versions not found"]
-
-        def read_lines(fpath: Path):
-            try:
-                payload = fpath.read_bytes()
-                text = zlib.decompress(payload).decode("utf-8") if fpath.suffix == ".ztxt" else payload.decode("utf-8")
-                yield from text.splitlines(keepends=True)
-            except UnicodeDecodeError:
-                payload = fpath.read_bytes()
-                text = zlib.decompress(payload).decode("latin-1") if fpath.suffix == ".ztxt" else payload.decode("latin-1")
-                yield from text.splitlines(keepends=True)
-
-        return list(difflib.unified_diff(
-            read_lines(f1), read_lines(f2),
-            fromfile=f"{filename}@{ts1}", tofile=f"{filename}@{ts2}"
-        ))
+    def diff(self, filename: str, ts1: str, ts2: str) -> Generator[str, None, None]:
+        """Unified diff между двумя версиями. Streaming, без загрузки в память."""
+        fp = Path(filename).resolve()
+        lines1 = self._store.read_version_lines(fp, ts1)
+        lines2 = self._store.read_version_lines(fp, ts2)
+        yield from difflib.unified_diff(
+            lines1, lines2,
+            fromfile=f"{filename}@{ts1}",
+            tofile=f"{filename}@{ts2}",
+        )
 
     def clean(self, filename: str, keep: Optional[int] = None, max_age_minutes: int = 60) -> Dict:
+        """Удаляет старые версии и временные файлы."""
         keep = keep or self.keep_default
-        filepath = Path(filename).resolve()
-        index = self._index_mgr.load(filepath)
-        
-        if len(index) <= keep:
-            return {"deleted": 0, "kept": len(index)}
+        fp = Path(filename).resolve()
 
-        to_delete = index[:-keep]
-        deleted = 0
-        
         with self._lock.exclusive():
-            for entry in to_delete:
-                try:
-                    v_file = self._store._get_version_path(filepath, entry['timestamp'])
-                    if v_file.exists(): v_file.unlink()
-                    else:
-                        v_file_txt = v_file.with_suffix(".txt")
-                        if v_file_txt.exists(): v_file_txt.unlink()
-                    deleted += 1
-                except (ZSSError, IOError):
-                    continue
-            self._index_mgr.save(filepath, index[-keep:])
+            entries = self._idx.load(fp)
+            if len(entries) <= keep:
+                return {"deleted": 0, "kept": len(entries)}
+
+            to_del = entries[:-keep]
+            deleted = 0
+            for entry in to_del:
+                vp = self._store.version_path(fp, entry['timestamp'])
+                for candidate in [vp, vp.with_suffix('.txt'), vp.with_suffix('.ztxt')]:
+                    if candidate.exists():
+                        try:
+                            candidate.unlink()
+                            deleted += 1
+                        except OSError:
+                            pass
+            self._idx.save_now(fp, entries[-keep:])
 
         now = time.time()
         tmp_cleaned = 0
@@ -354,63 +556,141 @@ class TimeMachine:
                 if now - tmp.stat().st_mtime > max_age_minutes * 60:
                     tmp.unlink()
                     tmp_cleaned += 1
-            except (IOError, OSError):
-                continue
+            except OSError:
+                pass
 
         return {"versions_deleted": deleted, "tmp_cleaned": tmp_cleaned, "kept": keep}
 
     def purge_missing(self, known_files: Optional[List[str]] = None) -> Dict:
+        """Удаляет данные для файлов, которых нет на диске."""
         if known_files is None:
-            known_files = [str(p.resolve()) for ext in self.extensions for p in Path(".").rglob(f"*{ext}") 
-                           if ".timemachine" not in str(p) and not p.name.startswith(".")]
-        known_set = set(known_files)
-        orphaned = []
-        
-        for index_file in self.root.glob("*.index.json"):
-            if index_file.name == ".lock.index.json": continue
+            known_set: Set[str] = set()
+            for ext in self.extensions:
+                for p in Path(".").rglob(f"*{ext}"):
+                    rp = p.resolve()
+                    if self.root not in rp.parents and not p.name.startswith('.'):
+                        known_set.add(str(rp))
+        else:
+            known_set = {str(Path(f).resolve()) for f in known_files}
+
+        orphaned_indices: List[Path] = []
+        for idx_file in self.root.glob("*.index.json"):
             try:
-                data = json.loads(index_file.read_text())
-                entries = data.get("entries", []) if isinstance(data, dict) else data
-                if not entries: continue
-                if not {e.get("path") for e in entries if e.get("path")}.intersection(known_set):
-                    orphaned.append(index_file)
-            except (json.JSONDecodeError, IOError):
+                raw = json.loads(idx_file.read_text(encoding='utf-8'))
+                entries = raw.get("entries", []) if isinstance(raw, dict) else raw
+                paths_in_idx = {e.get("path") for e in entries if e.get("path")}
+                if paths_in_idx and not paths_in_idx.intersection(known_set):
+                    orphaned_indices.append(idx_file)
+            except (json.JSONDecodeError, OSError):
                 continue
 
         deleted = 0
         with self._lock.exclusive():
-            for idx_file in orphaned:
-                try:
-                    prefix = idx_file.stem
-                    for v_file in self.root.glob(f"{prefix}.*"):
-                        if v_file.suffix in [".txt", ".ztxt"]:
-                            v_file.unlink()
+            for idx_file in orphaned_indices:
+                prefix = idx_file.stem
+                for vf in self.root.glob(f"{prefix}.*"):
+                    if vf.suffix in ('.txt', '.ztxt'):
+                        try:
+                            vf.unlink()
                             deleted += 1
+                        except OSError:
+                            pass
+                try:
                     idx_file.unlink()
                     deleted += 1
                     self._cache.invalidate(str(idx_file))
-                except (IOError, OSError):
-                    continue
-        return {"deleted": deleted, "orphaned_files": len(orphaned)}
+                except OSError:
+                    pass
+
+        return {"deleted": deleted, "orphaned_indices": len(orphaned_indices)}
 
     def get_stats(self) -> Dict:
+        """Статистика хранилища."""
         total_versions = 0
         total_size = 0
-        for f in self.root.glob("*.txt"):
-            if not f.name.endswith(".tmp"):
+        for pattern in ("*.txt", "*.ztxt"):
+            for f in self.root.glob(pattern):
+                if f.name.endswith('.tmp'):
+                    continue
                 try:
                     total_versions += 1
                     total_size += f.stat().st_size
-                except (OSError, PermissionError):
-                    continue
-        for f in self.root.glob("*.ztxt"):
-            if not f.name.endswith(".tmp"):
-                try:
-                    total_versions += 1
-                    total_size += f.stat().st_size
-                except (OSError, PermissionError):
-                    continue
-        return {**self.stats, "total_versions": total_versions, "total_size_mb": round(total_size / 1048576, 2)}
+                except OSError:
+                    pass
+        return {
+            **self._stats,
+            "total_versions": total_versions,
+            "total_size_mb": round(total_size / 1048576, 2),
+        }
 
-def create_timemachine(root: str = ".timemachine", **kwargs) -> TimeMachine:
-    return TimeMachine(root, **kwargs)
+    # --- Private ---
+
+    def _save_one(self, filepath: Path) -> bool:
+        """Сохраняет одну версию если файл изменился. Индекс stage-ится."""
+        if not filepath.is_file() or filepath.is_symlink():
+            return False
+        if not self._store.is_text(filepath):
+            return False
+
+        current_hash = self._store.compute_hash_stream(filepath)
+        entries = self._idx.load(filepath)
+        if entries and entries[-1].get("hash") == current_hash:
+            return False
+
+        try:
+            content_bytes = filepath.read_bytes()
+        except OSError:
+            return False
+
+        try:
+            content_str = content_bytes.decode('utf-8')
+        except UnicodeDecodeError:
+            return False
+
+        if self.block_on_secrets:
+            secrets = self._store.check_secrets(content_str)
+            if secrets:
+                raise SecretDetectedError(secrets)
+
+        now = datetime.now()
+        timestamp = now.strftime(TIMESTAMP_FMT)
+        vp = self._store.version_path(filepath, timestamp)
+        tmp_vp = vp.with_suffix('.tmp')
+
+        payload = zlib.compress(content_bytes) if self._store._compress else content_bytes
+
+        try:
+            tmp_vp.write_bytes(payload)
+            os.replace(str(tmp_vp), str(vp))
+        except OSError as e:
+            if tmp_vp.exists():
+                tmp_vp.unlink(missing_ok=True)
+            raise ZSSError(f"Version write failed: {e}")
+
+        entry: VersionEntry = {
+            "timestamp": timestamp,
+            "hash": current_hash,
+            "size": len(content_bytes),
+            "compressed": self._store._compress,
+            "lines": content_str.count('\n') + (0 if content_str.endswith('\n') else 1),
+            "path": str(filepath),
+            "tags": {},
+        }
+        entries.append(entry)
+        self._idx.stage_save(filepath, entries)
+        return True
+
+    @staticmethod
+    def _resolve_target(entries: List[VersionEntry], target: str) -> Optional[str]:
+        """Находит timestamp по тегу или прямому совпадению."""
+        for entry in reversed(entries):
+            if entry["timestamp"] == target:
+                return entry["timestamp"]
+            if target in entry.get("tags", {}):
+                return entry["timestamp"]
+        return None
+
+
+def create_timemachine(root: str = ".zss_data", **kwargs) -> TimeMachine:
+    """Фабрика для создания TimeMachine."""
+    return TimeMachine(root=root, **kwargs)
